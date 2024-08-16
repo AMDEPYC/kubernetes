@@ -720,7 +720,7 @@ func TestTakeByTopologyUnCoreCachePacked(t *testing.T) {
 			"take first available uncore cache from second socket",
 			topoUncoreDualSocketNoSMT,
 			StaticPolicyOptions{AlignByUnCoreCacheOption: true},
-			mustParseCPUSet(t, "8-15"),
+			mustParseCPUSet(t, "2-3,8-15"),
 			4,
 			"",
 			cpuset.New(8, 9, 10, 11),
