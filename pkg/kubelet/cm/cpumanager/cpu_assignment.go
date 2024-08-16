@@ -95,8 +95,10 @@ func standardDeviation(xs []int) float64 {
 type numaOrSocketsFirstFuncs interface {
 	takeFullFirstLevel()
 	takeFullSecondLevel()
+	takeThirdLevel()
 	sortAvailableNUMANodes() []int
 	sortAvailableSockets() []int
+	sortAvailableUnCoreCaches() []int
 	sortAvailableCores() []int
 }
 
@@ -116,6 +118,23 @@ func (n *numaFirst) takeFullFirstLevel() {
 // from the set of sockets as the second level.
 func (n *numaFirst) takeFullSecondLevel() {
 	n.acc.takeFullSockets()
+}
+
+// In Split L3 Topology, we take from the sets of uncorecache as the thrid level
+func (n *numaFirst) takeThirdLevel() {
+	n.acc.takeUnCoreCache()
+}
+
+// If NUMA nodes are higher in the memory hierarchy than sockets, then just
+// sort the NUMA nodes directly, and return them.
+func (n *numaFirst) sortAvailableUnCoreCaches() []int {
+	var result []int
+	for _, socket := range n.acc.sortAvailableNUMANodes() {
+		uncore := n.acc.details.UnCoreInNUMANodes(socket).UnsortedList()
+		n.acc.sort(uncore, n.acc.details.CPUsInUnCoreCaches)
+		result = append(result, uncore...)
+	}
+	return result
 }
 
 // If NUMA nodes are higher in the memory hierarchy than sockets, then just
@@ -163,6 +182,10 @@ func (s *socketsFirst) takeFullSecondLevel() {
 	s.acc.takeFullNUMANodes()
 }
 
+func (s *socketsFirst) takeThirdLevel() {
+	s.acc.takeUnCoreCache()
+}
+
 // If sockets are higher in the memory hierarchy than NUMA nodes, then we need
 // to pull the set of NUMA nodes out of each sorted Socket, and accumulate the
 // partial order across them.
@@ -184,6 +207,18 @@ func (s *socketsFirst) sortAvailableSockets() []int {
 	return sockets
 }
 
+// If sockets  higher in the memory hierarchy than NUMA nodes, then uncorecache
+// sit directly below NUMA Nodes in the memory hierchy
+func (s *socketsFirst) sortAvailableUnCoreCaches() []int {
+	var result []int
+	for _, uncore := range s.acc.sortAvailableNUMANodes() {
+		uncore := s.acc.details.UnCoreInNUMANodes(uncore).UnsortedList()
+		s.acc.sort(uncore, s.acc.details.CPUsInUnCoreCaches)
+		result = append(result, uncore...)
+	}
+	return result
+}
+
 // If sockets are higher in the memory hierarchy than NUMA nodes, then cores
 // sit directly below NUMA Nodes in the memory hierarchy.
 func (s *socketsFirst) sortAvailableCores() []int {
@@ -195,6 +230,58 @@ func (s *socketsFirst) sortAvailableCores() []int {
 	}
 	return result
 }
+
+type availableCPUSorter interface {
+	sort() []int
+}
+
+type sortCPUsPacked struct{ acc *cpuAccumulator }
+type sortCPUsSpread struct{ acc *cpuAccumulator }
+
+var _ availableCPUSorter = (*sortCPUsPacked)(nil)
+var _ availableCPUSorter = (*sortCPUsSpread)(nil)
+
+func (s sortCPUsPacked) sort() []int {
+	return s.acc.sortAvailableCPUsPacked()
+}
+
+func (s sortCPUsSpread) sort() []int {
+	return s.acc.sortAvailableCPUsSpread()
+}
+
+// CPUSortingStrategy describes the CPU sorting solution within the socket scope.
+// Using topoDualSocketHT (12 CPUs, 2 sockets, 6 cores) as an example:
+//
+//	CPUDetails: map[int]topology.CPUInfo{
+//		0:  {CoreID: 0, SocketID: 0, NUMANodeID: 0},
+//		1:  {CoreID: 1, SocketID: 1, NUMANodeID: 1},
+//		2:  {CoreID: 2, SocketID: 0, NUMANodeID: 0},
+//		3:  {CoreID: 3, SocketID: 1, NUMANodeID: 1},
+//		4:  {CoreID: 4, SocketID: 0, NUMANodeID: 0},
+//		5:  {CoreID: 5, SocketID: 1, NUMANodeID: 1},
+//		6:  {CoreID: 0, SocketID: 0, NUMANodeID: 0},
+//		7:  {CoreID: 1, SocketID: 1, NUMANodeID: 1},
+//		8:  {CoreID: 2, SocketID: 0, NUMANodeID: 0},
+//		9:  {CoreID: 3, SocketID: 1, NUMANodeID: 1},
+//		10: {CoreID: 4, SocketID: 0, NUMANodeID: 0},
+//		11: {CoreID: 5, SocketID: 1, NUMANodeID: 1},
+//	},
+//
+// - CPUSortingOptionPacked sorts CPUs in a packed manner, where CPUs are grouped by core
+// before moving to the next core, resulting in packed cores, like:
+// 0, 2, 4, 6, 8, 10, 1, 3, 5, 7, 9, 11
+// - CPUSortingOptionSpread sorts CPUs in a spread manner, where CPUs are spread across cores
+// before moving to the next CPU, resulting in spread-out cores, like:
+// 0, 6, 2, 8, 4, 10, 1, 7, 3, 9, 5, 11
+//
+// By default, CPUSortingOptionPacked will be used, and CPUSortingOptionSpread will only be activated
+// when the user specifies the `DistributeCPUsAcrossCoresOption` static policy option.
+type CPUSortingStrategy string
+
+const (
+	CPUSortingStrategyPacked CPUSortingStrategy = "packed"
+	CPUSortingStrategySpread CPUSortingStrategy = "spread"
+)
 
 type cpuAccumulator struct {
 	// `topo` describes the layout of CPUs (i.e. hyper-threads if hyperthreading is on) between
@@ -223,9 +310,15 @@ type cpuAccumulator struct {
 	result cpuset.CPUSet
 
 	numaOrSocketsFirst numaOrSocketsFirstFuncs
+
+	// availableCPUSorter is used to control the cpu sorting result.
+	// The sequence of returned CPU IDs depends on the policy.
+	// By default, cpus is sorted by sortAvailableCPUsPacked()
+	// If packed is false, cpu is sorted by sortAvailableCPUsSpread()
+	availableCPUSorter availableCPUSorter
 }
 
-func newCPUAccumulator(topo *topology.CPUTopology, availableCPUs cpuset.CPUSet, numCPUs int) *cpuAccumulator {
+func newCPUAccumulator(topo *topology.CPUTopology, availableCPUs cpuset.CPUSet, numCPUs int, cpuSortingStrategy CPUSortingStrategy) *cpuAccumulator {
 	acc := &cpuAccumulator{
 		topo:          topo,
 		details:       topo.CPUDetails.KeepOnly(availableCPUs),
@@ -237,6 +330,12 @@ func newCPUAccumulator(topo *topology.CPUTopology, availableCPUs cpuset.CPUSet, 
 		acc.numaOrSocketsFirst = &numaFirst{acc}
 	} else {
 		acc.numaOrSocketsFirst = &socketsFirst{acc}
+	}
+
+	if cpuSortingStrategy == CPUSortingStrategyPacked {
+		acc.availableCPUSorter = &sortCPUsPacked{acc}
+	} else {
+		acc.availableCPUSorter = &sortCPUsSpread{acc}
 	}
 
 	return acc
@@ -252,6 +351,12 @@ func (a *cpuAccumulator) isNUMANodeFree(numaID int) bool {
 // "fully available" means that all the CPUs in it are free.
 func (a *cpuAccumulator) isSocketFree(socketID int) bool {
 	return a.details.CPUsInSockets(socketID).Size() == a.topo.CPUsPerSocket()
+}
+
+// Returns true if the supplied UnCoreCache is fully available in `a.details`.
+// "fully available" means that all the CPUs in it are free.
+func (a *cpuAccumulator) isUnCoreCacheFree(uncoreID int) bool {
+	return a.details.CPUsInUnCoreCaches(uncoreID).Size() == a.topo.CPUDetails.CPUsInUnCoreCaches(uncoreID).Size()
 }
 
 // Returns true if the supplied core is fully available in `a.details`.
@@ -282,6 +387,26 @@ func (a *cpuAccumulator) freeSockets() []int {
 	return free
 }
 
+// Returns free UnCoreCache IDs as a slice sorted by sortAvailableUnCoreCache().
+func (a *cpuAccumulator) freeUnCoreCache() []int {
+	free := []int{}
+	for _, uncore := range a.numaOrSocketsFirst.sortAvailableUnCoreCaches() {
+		if a.isUnCoreCacheFree(uncore) {
+			free = append(free, uncore)
+		}
+	}
+	return free
+}
+
+// Returns all UnCoreCache IDs as a slice sorted by sortAvailableUnCoreCache().
+func (a *cpuAccumulator) allUnCoreCache() []int {
+	all := []int{}
+	for _, uncore := range a.numaOrSocketsFirst.sortAvailableUnCoreCaches() {
+		all = append(all, uncore)
+	}
+	return all
+}
+
 // Returns free core IDs as a slice sorted by sortAvailableCores().
 func (a *cpuAccumulator) freeCores() []int {
 	free := []int{}
@@ -293,9 +418,9 @@ func (a *cpuAccumulator) freeCores() []int {
 	return free
 }
 
-// Returns free CPU IDs as a slice sorted by sortAvailableCPUs().
+// Returns free CPU IDs as a slice sorted by sortAvailableCPUsPacked().
 func (a *cpuAccumulator) freeCPUs() []int {
-	return a.sortAvailableCPUs()
+	return a.availableCPUSorter.sort()
 }
 
 // Sorts the provided list of NUMA nodes/sockets/cores/cpus referenced in 'ids'
@@ -404,10 +529,23 @@ func (a *cpuAccumulator) sortAvailableCores() []int {
 // same way as described in the previous paragraph, except that the priority of NUMA nodes and
 // sockets is inverted (e.g. first sort the CPUs by number of free CPUs in their NUMA nodes, then,
 // for each NUMA node, sort the CPUs by number of free CPUs in their sockets, etc...).
-func (a *cpuAccumulator) sortAvailableCPUs() []int {
+func (a *cpuAccumulator) sortAvailableCPUsPacked() []int {
 	var result []int
 	for _, core := range a.sortAvailableCores() {
 		cpus := a.details.CPUsInCores(core).UnsortedList()
+		sort.Ints(cpus)
+		result = append(result, cpus...)
+	}
+	return result
+}
+
+// Sort all available CPUs:
+// - First by core using sortAvailableSockets().
+// - Then within each socket, sort cpus directly using the sort() algorithm defined above.
+func (a *cpuAccumulator) sortAvailableCPUsSpread() []int {
+	var result []int
+	for _, socket := range a.sortAvailableSockets() {
+		cpus := a.details.CPUsInSockets(socket).UnsortedList()
 		sort.Ints(cpus)
 		result = append(result, cpus...)
 	}
@@ -441,6 +579,45 @@ func (a *cpuAccumulator) takeFullSockets() {
 		a.take(cpusInSocket)
 	}
 }
+func (a *cpuAccumulator) takeFullUnCore() {
+	for _, uncore := range a.freeUnCoreCache() {
+		cpusInUnCore := a.topo.CPUDetails.CPUsInUnCoreCaches(uncore)
+		if !a.needsAtLeast(cpusInUnCore.Size()) {
+			continue
+		}
+		klog.V(4).InfoS("takeFullCCD: claiming CCD ", uncore)
+		a.take(cpusInUnCore)
+	}
+}
+
+// First try to take partial uncorecache (CCD), if available and the request size can fit w/in the uncorecache.
+// Second try to take the full CCD if available and need is at least the size of the uncorecache group.
+func (a *cpuAccumulator) takeUnCoreCache() {
+	// check if SMT ON
+
+	for _, uncore := range a.allUnCoreCache() {
+		numCoresNeeded := a.numCPUsNeeded / a.topo.CPUsPerCore() //this is another new change
+
+		var freeCPUsInUncorecache cpuset.CPUSet
+		//need to get needed cores in uncorecache
+		freeCoresInUncorecache := a.details.CoresNeededInUnCoreCache(numCoresNeeded, uncore)
+		klog.V(2).Info("free cores from a.details list: ", freeCoresInUncorecache)
+		for _, coreId := range freeCoresInUncorecache.List() {
+			freeCPUsInUncorecache = freeCPUsInUncorecache.Union(a.topo.CPUDetails.CPUsInCores(coreId))
+		}
+		klog.V(2).Info("freeCPUsInUncorecache  : ", freeCPUsInUncorecache)
+		if a.numCPUsNeeded == freeCPUsInUncorecache.Size() {
+			klog.V(4).InfoS("takePartialUncore: claiming cores from Uncorecache ID", uncore)
+			a.take(freeCPUsInUncorecache)
+		}
+		//take full Uncorecache if the numCPUsNeeded is greater the L3 cache size
+		a.takeFullUnCore()
+
+		if a.isSatisfied() {
+			return
+		}
+	}
+}
 
 func (a *cpuAccumulator) takeFullCores() {
 	for _, core := range a.freeCores() {
@@ -454,7 +631,7 @@ func (a *cpuAccumulator) takeFullCores() {
 }
 
 func (a *cpuAccumulator) takeRemainingCPUs() {
-	for _, cpu := range a.sortAvailableCPUs() {
+	for _, cpu := range a.availableCPUSorter.sort() {
 		klog.V(4).InfoS("takeRemainingCPUs: claiming CPU", "cpu", cpu)
 		a.take(cpuset.New(cpu))
 		if a.isSatisfied() {
@@ -581,8 +758,8 @@ func (a *cpuAccumulator) iterateCombinations(n []int, k int, f func([]int) LoopC
 // the least amount of free CPUs to the one with the highest amount of free CPUs (i.e. in ascending
 // order of free CPUs). For any NUMA node, the cores are selected from the ones in the socket with
 // the least amount of free CPUs to the one with the highest amount of free CPUs.
-func takeByTopologyNUMAPacked(topo *topology.CPUTopology, availableCPUs cpuset.CPUSet, numCPUs int) (cpuset.CPUSet, error) {
-	acc := newCPUAccumulator(topo, availableCPUs, numCPUs)
+func takeByTopologyNUMAPacked(topo *topology.CPUTopology, availableCPUs cpuset.CPUSet, numCPUs int, cpuSortingStrategy CPUSortingStrategy) (cpuset.CPUSet, error) {
+	acc := newCPUAccumulator(topo, availableCPUs, numCPUs, cpuSortingStrategy)
 	if acc.isSatisfied() {
 		return acc.result, nil
 	}
@@ -606,12 +783,68 @@ func takeByTopologyNUMAPacked(topo *topology.CPUTopology, availableCPUs cpuset.C
 
 	// 2. Acquire whole cores, if available and the container requires at least
 	//    a core's-worth of CPUs.
-	acc.takeFullCores()
+	//    If `CPUSortingStrategySpread` is specified, skip taking the whole core.
+	if cpuSortingStrategy != CPUSortingStrategySpread {
+		acc.takeFullCores()
+		if acc.isSatisfied() {
+			return acc.result, nil
+		}
+	}
+
+	// 3. Acquire single threads, preferring to fill partially-allocated cores
+	//    on the same sockets as the whole cores we have already taken in this
+	//    allocation.
+	acc.takeRemainingCPUs()
 	if acc.isSatisfied() {
 		return acc.result, nil
 	}
 
-	// 3. Acquire single threads, preferring to fill partially-allocated cores
+	return cpuset.New(), fmt.Errorf("failed to allocate cpus")
+}
+
+// takeByTopologyUnCoreCachePacked uses the "packed" sorting strategy similar to takeByTopologyNUMAPacked.
+// It includes an additional level of sorting by uncorecache
+func takeByTopologyUnCoreCachePacked(topo *topology.CPUTopology, availableCPUs cpuset.CPUSet, numCPUs int, cpuSortingStrategy CPUSortingStrategy) (cpuset.CPUSet, error) {
+	acc := newCPUAccumulator(topo, availableCPUs, numCPUs, cpuSortingStrategy)
+	if acc.isSatisfied() {
+		return acc.result, nil
+	}
+	if acc.isFailed() {
+		return cpuset.New(), fmt.Errorf("not enough cpus available to satisfy request: requested=%d, available=%d", numCPUs, availableCPUs.Size())
+	}
+
+	// Algorithm: topology-aware best-fit
+	// 1. Acquire whole NUMA nodes and sockets, if available and the container
+	//    requires at least a NUMA node or socket's-worth of CPUs. If NUMA
+	//    Nodes map to 1 or more sockets, pull from NUMA nodes first.
+	//    Otherwise pull from sockets first.
+	acc.numaOrSocketsFirst.takeFullFirstLevel()
+	if acc.isSatisfied() {
+		return acc.result, nil
+	}
+	acc.numaOrSocketsFirst.takeFullSecondLevel()
+	if acc.isSatisfied() {
+		return acc.result, nil
+	}
+
+	// 2. Acquire partial uncorecache, if there are enough CPUs available to satisfy the container requirement
+	//    Acquire the full uncorecache, if available and the container requires at least all the CPUs in the uncorecache grouping
+	acc.numaOrSocketsFirst.takeThirdLevel()
+	if acc.isSatisfied() {
+		return acc.result, nil
+	}
+
+	// 3. Acquire whole cores, if available and the container requires at least
+	//    a core's-worth of CPUs.
+	//    If `CPUSortingStrategySpread` is specified, skip taking the whole core.
+	if cpuSortingStrategy != CPUSortingStrategySpread {
+		acc.takeFullCores()
+		if acc.isSatisfied() {
+			return acc.result, nil
+		}
+	}
+
+	// 4. Acquire single threads, preferring to fill partially-allocated cores
 	//    on the same sockets as the whole cores we have already taken in this
 	//    allocation.
 	acc.takeRemainingCPUs()
@@ -685,16 +918,16 @@ func takeByTopologyNUMAPacked(topo *topology.CPUTopology, availableCPUs cpuset.C
 // of size 'cpuGroupSize' according to the algorithm described above. This is
 // important, for example, to ensure that all CPUs (i.e. all hyperthreads) from
 // a single core are allocated together.
-func takeByTopologyNUMADistributed(topo *topology.CPUTopology, availableCPUs cpuset.CPUSet, numCPUs int, cpuGroupSize int) (cpuset.CPUSet, error) {
+func takeByTopologyNUMADistributed(topo *topology.CPUTopology, availableCPUs cpuset.CPUSet, numCPUs int, cpuGroupSize int, cpuSortingStrategy CPUSortingStrategy) (cpuset.CPUSet, error) {
 	// If the number of CPUs requested cannot be handed out in chunks of
 	// 'cpuGroupSize', then we just call out the packing algorithm since we
 	// can't distribute CPUs in this chunk size.
 	if (numCPUs % cpuGroupSize) != 0 {
-		return takeByTopologyNUMAPacked(topo, availableCPUs, numCPUs)
+		return takeByTopologyNUMAPacked(topo, availableCPUs, numCPUs, cpuSortingStrategy)
 	}
 
 	// Otherwise build an accumulator to start allocating CPUs from.
-	acc := newCPUAccumulator(topo, availableCPUs, numCPUs)
+	acc := newCPUAccumulator(topo, availableCPUs, numCPUs, cpuSortingStrategy)
 	if acc.isSatisfied() {
 		return acc.result, nil
 	}
@@ -873,7 +1106,7 @@ func takeByTopologyNUMADistributed(topo *topology.CPUTopology, availableCPUs cpu
 		// size 'cpuGroupSize' from 'bestCombo'.
 		distribution := (numCPUs / len(bestCombo) / cpuGroupSize) * cpuGroupSize
 		for _, numa := range bestCombo {
-			cpus, _ := takeByTopologyNUMAPacked(acc.topo, acc.details.CPUsInNUMANodes(numa), distribution)
+			cpus, _ := takeByTopologyNUMAPacked(acc.topo, acc.details.CPUsInNUMANodes(numa), distribution, cpuSortingStrategy)
 			acc.take(cpus)
 		}
 
@@ -888,7 +1121,7 @@ func takeByTopologyNUMADistributed(topo *topology.CPUTopology, availableCPUs cpu
 				if acc.details.CPUsInNUMANodes(numa).Size() < cpuGroupSize {
 					continue
 				}
-				cpus, _ := takeByTopologyNUMAPacked(acc.topo, acc.details.CPUsInNUMANodes(numa), cpuGroupSize)
+				cpus, _ := takeByTopologyNUMAPacked(acc.topo, acc.details.CPUsInNUMANodes(numa), cpuGroupSize, cpuSortingStrategy)
 				acc.take(cpus)
 				remainder -= cpuGroupSize
 			}
@@ -912,5 +1145,5 @@ func takeByTopologyNUMADistributed(topo *topology.CPUTopology, availableCPUs cpu
 
 	// If we never found a combination of NUMA nodes that we could properly
 	// distribute CPUs across, fall back to the packing algorithm.
-	return takeByTopologyNUMAPacked(topo, availableCPUs, numCPUs)
+	return takeByTopologyNUMAPacked(topo, availableCPUs, numCPUs, cpuSortingStrategy)
 }
